@@ -11,10 +11,13 @@
 //! The example implements a fictitious Light device (an On-Off Matter cluster).
 
 use core::pin::pin;
+use core::time::Duration;
 
 use embassy_futures::select::select;
-use embassy_time::{Duration, Timer};
+use embassy_time::Timer;
 
+use esp_idf_hal::delay::{TickType, BLOCK};
+use esp_idf_hal::units::KiloHertz;
 use esp_idf_matter::matter::data_model::cluster_basic_information::BasicInfoConfig;
 use esp_idf_matter::matter::data_model::cluster_on_off;
 use esp_idf_matter::matter::data_model::device_types::DEV_TYPE_ON_OFF_LIGHT;
@@ -35,7 +38,11 @@ use esp_idf_svc::timer::EspTaskTimerService;
 
 use log::{error, info};
 
+use rs_matter::data_model::objects::DeviceType;
 use static_cell::StaticCell;
+
+mod humidity_measurement;
+mod temperature_measurement;
 
 fn main() -> Result<(), anyhow::Error> {
     EspLogger::initialize_default();
@@ -104,6 +111,13 @@ async fn matter() -> Result<(), anyhow::Error> {
     // Can be anything implementing `rs_matter::data_model::AsyncHandler`
     let on_off = cluster_on_off::OnOffCluster::new(Dataver::new_rand(stack.matter().rand()));
 
+    let temperature_measurement = temperature_measurement::TemperatureMeasurementCluster::new(
+        Dataver::new_rand(stack.matter().rand()),
+    );
+    let humidity_measurement = humidity_measurement::HumidityMeasurementCluster::new(
+        Dataver::new_rand(stack.matter().rand()),
+    );
+
     // Chain our endpoint clusters with the
     // (root) Endpoint 0 system clusters in the final handler
     let handler = stack
@@ -114,10 +128,34 @@ async fn matter() -> Result<(), anyhow::Error> {
             cluster_on_off::ID,
             HandlerCompat(&on_off),
         )
+        .chain(
+            TEMPERATURE_SENSOR_ENDPOINT_ID,
+            temperature_measurement::ID,
+            HandlerCompat(&temperature_measurement),
+        )
+        .chain(
+            HUMIDITY_SENSOR_ENDPOINT_ID,
+            humidity_measurement::ID,
+            HandlerCompat(&humidity_measurement),
+        )
         // Each Endpoint needs a Descriptor cluster too
         // Just use the one that `rs-matter` provides out of the box
         .chain(
             LIGHT_ENDPOINT_ID,
+            descriptor::ID,
+            HandlerCompat(descriptor::DescriptorCluster::new(Dataver::new_rand(
+                stack.matter().rand(),
+            ))),
+        )
+        .chain(
+            TEMPERATURE_SENSOR_ENDPOINT_ID,
+            descriptor::ID,
+            HandlerCompat(descriptor::DescriptorCluster::new(Dataver::new_rand(
+                stack.matter().rand(),
+            ))),
+        )
+        .chain(
+            HUMIDITY_SENSOR_ENDPOINT_ID,
             descriptor::ID,
             HandlerCompat(descriptor::DescriptorCluster::new(Dataver::new_rand(
                 stack.matter().rand(),
@@ -144,30 +182,103 @@ async fn matter() -> Result<(), anyhow::Error> {
         core::future::pending(),
     ));
 
-    // Just for demoing purposes:
-    //
-    // Run a sample loop that simulates state changes triggered by the HAL
-    // Changes will be properly communicated to the Matter controllers
-    // (i.e. Google Home, Alexa) and other Matter devices thanks to subscriptions
     let mut device = pin!(async {
+        let mut switch = esp_idf_hal::gpio::PinDriver::input(peripherals.pins.gpio41).unwrap();
+        switch.set_pull(esp_idf_hal::gpio::Pull::Up).unwrap();
+
+        let i2c = peripherals.i2c0;
+        let sda = peripherals.pins.gpio2;
+        let scl = peripherals.pins.gpio1;
+        let config = esp_idf_hal::i2c::I2cConfig::new()
+            .baudrate(KiloHertz::from(100).into())
+            .scl_enable_pullup(true)
+            .sda_enable_pullup(true);
+        let mut i2c = esp_idf_hal::i2c::I2cDriver::new(i2c, sda, scl, &config).unwrap();
+        const SHT40_ADDRESS: u8 = 0x44;
+
+        i2c.write(SHT40_ADDRESS, &[0x94], BLOCK).unwrap();
+
+        let led = peripherals.pins.gpio35;
+        let channel = peripherals.rmt.channel0;
+        let config = esp_idf_hal::rmt::config::TransmitConfig::new().clock_divider(1);
+        let mut tx = esp_idf_hal::rmt::TxRmtDriver::new(channel, led, &config).unwrap();
+        let mut last_switch = switch.is_low();
         loop {
-            // Simulate user toggling the light with a physical switch every 5 seconds
-            Timer::after(Duration::from_secs(5)).await;
+            if let Ok(_) = i2c.write(SHT40_ADDRESS, &[0xFD], TickType::new_millis(100).ticks()) {
+                Timer::after(embassy_time::Duration::from_millis(10)).await;
+                let mut buffer = [0u8; 6];
+                if let Ok(_) = i2c.read(
+                    SHT40_ADDRESS,
+                    &mut buffer,
+                    TickType::new_millis(100).ticks(),
+                ) {
+                    let temperature = ((buffer[0] as u16) << 8 | buffer[1] as u16) as f32 * 175.0
+                        / 65535.0
+                        - 45.0;
+                    let relative_humidity =
+                        (((buffer[3] as u16) << 8 | buffer[4] as u16) as f32 * 125.0 / 65535.0
+                            - 6.0)
+                            .clamp(0.0, 100.0);
+                    //log::info!("Temperature: {:.2}°C", temperature);
+                    //log::info!("Relative Humidity: {:.2}%", relative_humidity);
+                    temperature_measurement.set(Some(temperature));
+                    humidity_measurement.set(Some(relative_humidity));
+                }
+            }
+            let switch_pressed = switch.is_low();
+            if switch_pressed && !last_switch {
+                on_off.set(!on_off.get());
+                stack.notify_changed();
+            }
+            last_switch = switch_pressed;
 
-            // Toggle
-            on_off.set(!on_off.get());
-
-            // Let the Matter stack know that we have changed
-            // the state of our Light device
-            stack.notify_changed();
-
-            info!("Light toggled");
+            if on_off.get() {
+                neopixel(0xffffff, &mut tx).unwrap();
+            } else {
+                neopixel(0x000000, &mut tx).unwrap();
+            }
+            Timer::after(embassy_time::Duration::from_millis(100)).await;
         }
     });
 
     // Schedule the Matter run & the device loop together
     select(&mut matter, &mut device).coalesce().await?;
 
+    Ok(())
+}
+
+fn neopixel(color: u32, tx: &mut esp_idf_hal::rmt::TxRmtDriver) -> anyhow::Result<()> {
+    let ticks_hz = tx.counter_clock()?;
+    let (t0h, t0l, t1h, t1l) = (
+        esp_idf_hal::rmt::Pulse::new_with_duration(
+            ticks_hz,
+            esp_idf_hal::rmt::PinState::High,
+            &Duration::from_nanos(350),
+        )?,
+        esp_idf_hal::rmt::Pulse::new_with_duration(
+            ticks_hz,
+            esp_idf_hal::rmt::PinState::Low,
+            &Duration::from_nanos(800),
+        )?,
+        esp_idf_hal::rmt::Pulse::new_with_duration(
+            ticks_hz,
+            esp_idf_hal::rmt::PinState::High,
+            &Duration::from_nanos(700),
+        )?,
+        esp_idf_hal::rmt::Pulse::new_with_duration(
+            ticks_hz,
+            esp_idf_hal::rmt::PinState::Low,
+            &Duration::from_nanos(600),
+        )?,
+    );
+    let mut signal = esp_idf_hal::rmt::FixedLengthSignal::<24>::new();
+    for i in (0..24).rev() {
+        let p = 2_u32.pow(i);
+        let bit: bool = p & color != 0;
+        let (high_pulse, low_pulse) = if bit { (t1h, t1l) } else { (t0h, t0l) };
+        signal.set(23 - i as usize, &(high_pulse, low_pulse))?;
+    }
+    tx.start_blocking(&signal)?;
     Ok(())
 }
 
@@ -179,6 +290,17 @@ static MATTER_STACK: StaticCell<EspWifiNCMatterStack<()>> = StaticCell::new();
 /// Endpoint 0 (the root endpoint) always runs
 /// the hidden Matter system clusters, so we pick ID=1
 const LIGHT_ENDPOINT_ID: u16 = 1;
+const TEMPERATURE_SENSOR_ENDPOINT_ID: u16 = 2;
+const HUMIDITY_SENSOR_ENDPOINT_ID: u16 = 3;
+
+pub const DEV_TYPE_TEMPERATURE_SENSOR: DeviceType = DeviceType {
+    dtype: 0x0302,
+    drev: 2,
+};
+pub const DEV_TYPE_HUMIDITY_SENSOR: DeviceType = DeviceType {
+    dtype: 0x0307,
+    drev: 2,
+};
 
 /// The Matter Light device Node
 const NODE: Node = Node {
@@ -189,6 +311,16 @@ const NODE: Node = Node {
             id: LIGHT_ENDPOINT_ID,
             device_types: &[DEV_TYPE_ON_OFF_LIGHT],
             clusters: &[descriptor::CLUSTER, cluster_on_off::CLUSTER],
+        },
+        Endpoint {
+            id: TEMPERATURE_SENSOR_ENDPOINT_ID,
+            device_types: &[DEV_TYPE_TEMPERATURE_SENSOR],
+            clusters: &[descriptor::CLUSTER, temperature_measurement::CLUSTER],
+        },
+        Endpoint {
+            id: HUMIDITY_SENSOR_ENDPOINT_ID,
+            device_types: &[DEV_TYPE_HUMIDITY_SENSOR],
+            clusters: &[descriptor::CLUSTER, humidity_measurement::CLUSTER],
         },
     ],
 };
