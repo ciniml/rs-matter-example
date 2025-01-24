@@ -1,0 +1,53 @@
+[package]
+name = "remo-e-matter"
+version = "0.1.0"
+authors = ["Kenta IDA <fuga@fugafuga.org>"]
+edition = "2021"
+resolver = "2"
+rust-version = "1.77"
+
+[[bin]]
+name = "remo-e-matter"
+harness = false # do not use the built in cargo test harness -> resolve rust-analyzer errors
+
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+debug = true    # Symbols are nice and they don't increase the size on Flash
+opt-level = "z"
+
+[features]
+default = ["std", "rs-matter-stack", "async-io-mini", "esp-idf-svc/binstart", "esp-idf-svc/critical-section"]
+async-io-mini = ["std", "edge-nal-std/async-io-mini"]
+std = ["esp-idf-svc/std", "edge-nal-std", "rs-matter-stack?/std"]
+
+[dependencies]
+log = { version = "0.4", default-features = false }
+heapless = "0.8"
+enumset = { version = "1", default-features = false }
+embassy-futures = "0.1"
+embassy-sync = "0.6"
+embassy-time = "0.4"
+esp-idf-svc = { version = "0.51", default-features = false, features = ["alloc", "embassy-sync", "embassy-time-driver", "experimental"] }
+embedded-svc = { version = "0.28", default-features = false }
+rs-matter = { version = "0.1", default-features = false, features = ["rustcrypto"] }
+rs-matter-stack = { git = "https://github.com/ivmarkov/rs-matter-stack", default-features = false, optional = true, features = ["rustcrypto"] }
+async-io = { version = "=2.0.0", default-features = false } # Workaround for https://github.com/smol-rs/async-lock/issues/84
+edge-nal = "0.5"
+edge-nal-std = { version = "0.5", default-features = false, optional = true }
+embassy-time-queue-utils = { version = "0.1", features = ["generic-queue-64"] }
+static_cell = "2.1"
+anyhow = "1"
+esp-idf-matter = { path = "external/esp-idf-matter" }
+
+[build-dependencies]
+embuild = "0.33"
+
+[patch.crates-io]
+rs-matter = { git = "https://github.com/project-chip/rs-matter" }
+esp-idf-sys = { path = "external/esp-idf-sys" }
+
+[package.metadata.esp-idf-sys]
+esp_idf_sdkconfig_defaults = "sdkconfig.defaults"
+esp_idf_components = ["bt", "esp_wifi", "main", "sdmmc", "esp_driver_sdmmc", "fatfs", "spiffs"]
